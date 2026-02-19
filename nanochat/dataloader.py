@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, num_shards=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
@@ -34,7 +34,15 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
 
     parquet_paths = list_parquet_files()
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    # parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+
+    # Limiting the number of shards for speedruns
+    num_shards = num_shards if num_shards is not None else -1
+    if split == "train":
+        parquet_paths = parquet_paths[:num_shards]
+    else:
+        parquet_paths = parquet_paths[-num_shards:]
+    # print("Number of shards: ", len(parquet_paths))
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
@@ -74,7 +82,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000,
+    num_shards=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -95,7 +104,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
+    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size, num_shards=num_shards)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
