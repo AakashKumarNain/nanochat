@@ -74,7 +74,7 @@ parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-every", type=int, default=50, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -107,7 +107,7 @@ if use_dummy_wandb:
 else:
     if not args.run:
         raise ValueError("Please provide a name for your experiment by passing a valid value to the `run` argument!")
-    wandb_run = wandb.init(project="nanochat_logged", name=args.run, config=user_config)
+    wandb_run = wandb.init(project="nanochat", name=args.run, config=user_config)
     # only for validation loop
     table = wandb.Table(columns=["exp_name", "epoch", "step", "prompt", "completion"], log_mode="INCREMENTAL")
 
@@ -563,21 +563,22 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    # if step % 100 == 0:
-    log_data = {
-        "step": step,
-        "total_training_flops": flops_so_far,
-        "total_training_time": total_training_time,
-        "train/loss": debiased_smooth_loss,
-        "train/lrm": lrm,
-        "train/dt": dt,
-        "train/tok_per_sec": tok_per_sec,
-        "train/mfu": mfu,
-        "train/epoch": epoch,
-        "train/muon_weight_decay": muon_weight_decay,
-        "train/tokens_consumed": total_tokens_consumed, 
-    }
-    wandb_run.log(log_data)
+    # Log at every 10 steps
+    if step % 10 == 0:
+        log_data = {
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "train/loss": debiased_smooth_loss,
+            "train/lrm": lrm,
+            "train/dt": dt,
+            "train/tok_per_sec": tok_per_sec,
+            "train/mfu": mfu,
+            "train/epoch": epoch,
+            "train/muon_weight_decay": muon_weight_decay,
+            "train/tokens_consumed": total_tokens_consumed, 
+        }
+        wandb_run.log(log_data)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
