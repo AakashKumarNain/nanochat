@@ -39,7 +39,7 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -74,10 +74,14 @@ parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-every", type=int, default=2, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# # Limit number of shards to use for training and validation, -1 means include all
+parser.add_argument("--num_train_shards", type=int, default=-1, help="Number of data shards to be used for training the model")
+parser.add_argument("--num_val_shards", type=int, default=-1, help="Number of data shards to be used for evalaution")
+
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -98,7 +102,14 @@ else:
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb() 
+else:
+    if not args.run:
+        raise ValueError("Please provide a name for your experiment by passing a valid value to the `run` argument!")
+    wandb_run = wandb.init(project="nanochat_logged", name=args.run, config=user_config)
+    # only for validation loop
+    table = wandb.Table(columns=["exp_name", "epoch", "step", "prompt", "completion"], log_mode="INCREMENTAL")
 
 # Flash Attention status
 if HAS_FA3:
@@ -170,22 +181,20 @@ if args.fp8:
         # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
+        # Filter: only convert layers with dimensions divisible by 16 (FP8 hardware requirement)
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
                 return False
+            # FP8 requires both in_features and out_features divisible by 16
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
                 return False
             return True
 
         fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
         convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+        num_fp8_layers = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped} (dims not divisible by 16)")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
@@ -318,8 +327,19 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+    tokenizer,
+    args.device_batch_size, args.max_seq_len,
+    split="train", device=device,
+    resume_state_dict=dataloader_resume_state_dict,
+    num_shards=args.num_train_shards,
+)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
+    tokenizer,
+    args.device_batch_size, args.max_seq_len,
+    split="val", device=device,
+    num_shards=args.num_val_shards,
+)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -378,6 +398,7 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    total_tokens_consumed = 0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -385,6 +406,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    total_tokens_consumed = loop_state["total_tokens_consumed"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -394,6 +416,7 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
 
 # Go!
 while True:
@@ -453,7 +476,10 @@ while True:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model), autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+            completion = tokenizer.decode(sample[0])
+            table.add_data(str(args.run), epoch, step, prompt, completion)
+        # Log the current state of the table incrementally
+        wandb_run.log({"val/completions": table})
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -476,6 +502,7 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "total_tokens_consumed": total_tokens_consumed,
                 },
             },
             rank=ddp_rank,
@@ -522,6 +549,7 @@ while True:
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    total_tokens_consumed += world_tokens_per_fwdbwd
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     # Calculate ETA based on average time per step (excluding first 10 steps)
@@ -535,19 +563,21 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
+    # if step % 100 == 0:
+    log_data = {
+        "step": step,
+        "total_training_flops": flops_so_far,
+        "total_training_time": total_training_time,
+        "train/loss": debiased_smooth_loss,
+        "train/lrm": lrm,
+        "train/dt": dt,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+        "train/epoch": epoch,
+        "train/muon_weight_decay": muon_weight_decay,
+        "train/tokens_consumed": total_tokens_consumed, 
+    }
+    wandb_run.log(log_data)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
