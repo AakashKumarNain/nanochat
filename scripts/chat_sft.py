@@ -86,8 +86,65 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
 # wandb logging init
+# use_dummy_wandb = args.run == "dummy" or not master_process
+# wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb() 
+else:
+    if not args.run:
+        raise ValueError("Please provide a name for your experiment by passing a valid value to the `run` argument!")
+    wandb_run = wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+    # only for validation loop
+    table = wandb.Table(columns=["exp_name", "step", "prompt", "completion"], log_mode="INCREMENTAL")
+
+from contextlib import nullcontext, contextmanager
+
+@contextmanager
+def disable_fp8(model):
+    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+
+    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
+    we swap out Float8Linear modules entirely and restore them after.
+    """
+    import torch.nn as nn
+
+    # Find all Float8Linear modules and their locations
+    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    for name, module in model.named_modules():
+        if 'Float8' in type(module).__name__:
+            if '.' in name:
+                parent_name, attr_name = name.rsplit('.', 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent = model
+                attr_name = name
+            fp8_locations.append((parent, attr_name, module))
+
+    if not fp8_locations:
+        yield  # No FP8 modules, nothing to do
+        return
+
+    # Swap Float8Linear -> nn.Linear (shares the same weight tensor, no copy)
+    for parent, attr_name, fp8_module in fp8_locations:
+        linear = nn.Linear(
+            fp8_module.in_features,
+            fp8_module.out_features,
+            bias=fp8_module.bias is not None,
+            device=fp8_module.weight.device,
+            dtype=fp8_module.weight.dtype,
+        )
+        linear.weight = fp8_module.weight  # share, don't copy
+        if fp8_module.bias is not None:
+            linear.bias = fp8_module.bias
+        setattr(parent, attr_name, linear)
+
+    try:
+        yield
+    finally:
+        # Restore Float8Linear modules
+        for parent, attr_name, fp8_module in fp8_locations:
+            setattr(parent, attr_name, fp8_module)
 
 # Flash Attention status
 if not HAS_FA3:
@@ -318,6 +375,7 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+total_tokens_consumed = 0
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -343,6 +401,31 @@ while True:
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
+        model.train()
+
+    
+    # Check completions in a while
+    if step > 0 and step % 5 == 0 and master_process:
+        model.eval()
+        engine = Engine(orig_model, tokenizer)
+        # Check completions for SFT stage as well
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
+        for prompt in prompts:
+            tokens = tokenizer(prompt, prepend="<|bos|>")
+            with disable_fp8(orig_model), autocast_ctx:
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            completion = tokenizer.decode(sample[0])
+            table.add_data(str(args.run), step, prompt, completion)
+        # Log the current state of the table incrementally
+        wandb_run.log({"val/completions": table})
         model.train()
 
     # once in a while: estimate the ChatCORE metric (all ranks participate)
@@ -447,6 +530,7 @@ while True:
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    total_tokens_consumed += world_tokens_per_fwdbwd
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
@@ -461,6 +545,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": current_epoch,
+            "train/tokens_consumed": total_tokens_consumed, 
         })
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
