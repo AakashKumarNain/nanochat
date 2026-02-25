@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+import numpy as np
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_token_bytes
@@ -59,7 +60,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=50, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
@@ -94,7 +95,7 @@ if use_dummy_wandb:
 else:
     if not args.run:
         raise ValueError("Please provide a name for your experiment by passing a valid value to the `run` argument!")
-    wandb_run = wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+    wandb_run = wandb.init(project="nanochat_logged_sft", name=args.run, config=user_config)
     # only for validation loop
     table = wandb.Table(columns=["exp_name", "step", "prompt", "completion"], log_mode="INCREMENTAL")
 
@@ -177,6 +178,42 @@ for name, fallback, source in [
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
+
+# Per-layer activation/QKV stats hooks (captured only when enabled)
+layer_stats_state = {"capture": False}
+layer_act_rms = [None] * depth
+layer_q_rms = [None] * depth
+layer_k_rms = [None] * depth
+layer_v_rms = [None] * depth
+
+def _rms(t):
+    return torch.sqrt(torch.mean(t.detach().float() ** 2))
+
+def _make_block_hook(layer_idx):
+    def hook(module, inp, out):
+        if not layer_stats_state["capture"]:
+            return
+        layer_act_rms[layer_idx] = _rms(out).item()
+    return hook
+
+def _make_qkv_hook(layer_idx, kind):
+    def hook(module, inp, out):
+        if not layer_stats_state["capture"]:
+            return
+        val = _rms(out).item()
+        if kind == "q":
+            layer_q_rms[layer_idx] = val
+        elif kind == "k":
+            layer_k_rms[layer_idx] = val
+        else:
+            layer_v_rms[layer_idx] = val
+    return hook
+
+for i, block in enumerate(orig_model.transformer.h):
+    block.register_forward_hook(_make_block_hook(i))
+    block.attn.c_q.register_forward_hook(_make_qkv_hook(i, "q"))
+    block.attn.c_k.register_forward_hook(_make_qkv_hook(i, "k"))
+    block.attn.c_v.register_forward_hook(_make_qkv_hook(i, "v"))
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -376,6 +413,7 @@ ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
 total_tokens_consumed = 0
+LAYER_STATS_EVERY = 50  # log per-layer stats to W&B every N steps (master only)
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -405,7 +443,7 @@ while True:
 
     
     # Check completions in a while
-    if step > 0 and step % 5 == 0 and master_process:
+    if master_process and (last_step or (args.eval_every > 0 and step % args.eval_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
         # Check completions for SFT stage as well
@@ -513,7 +551,87 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
+    log_layer_stats = master_process and ((step + 1) % LAYER_STATS_EVERY == 0)
+    pre_step_params = None
+    if log_layer_stats:
+        pre_step_params = [
+            [p.detach().clone() for p in block.parameters()]
+            for block in orig_model.transformer.h
+        ]
     optimizer.step()
+    layer_metrics = None
+    if log_layer_stats:
+        layer_stats_state["capture"] = True
+        for i in range(depth):
+            layer_act_rms[i] = None
+            layer_q_rms[i] = None
+            layer_k_rms[i] = None
+            layer_v_rms[i] = None
+        was_training = orig_model.training
+        orig_model.train()
+        with torch.no_grad(), autocast_ctx:
+            _ = orig_model(x, y)
+        if not was_training:
+            orig_model.eval()
+        layer_stats_state["capture"] = False
+
+        layer_metrics = {}
+        for i, block in enumerate(orig_model.transformer.h):
+            weight_sq = None
+            grad_sq = None
+            update_sq = None
+            for p, p_old in zip(block.parameters(), pre_step_params[i]):
+                if weight_sq is None:
+                    weight_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                    grad_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                    update_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                weight_sq += (p.detach().float() ** 2).sum()
+                if p.grad is not None:
+                    grad_sq += (p.grad.detach().float() ** 2).sum()
+                update_sq += ((p.detach() - p_old).float() ** 2).sum()
+            if weight_sq is None:
+                continue
+            weight_norm = torch.sqrt(weight_sq).item()
+            grad_norm = torch.sqrt(grad_sq).item()
+            update_norm = torch.sqrt(update_sq).item()
+            layer_metrics[f"layer/{i:02d}/weight_norm"] = weight_norm
+            layer_metrics[f"layer/{i:02d}/grad_norm"] = grad_norm
+            layer_metrics[f"layer/{i:02d}/update_ratio"] = update_norm / (weight_norm + 1e-8)
+            act_rms = layer_act_rms[i]
+            if act_rms is not None:
+                layer_metrics[f"layer/{i:02d}/act_rms"] = act_rms
+            q_rms = layer_q_rms[i]
+            k_rms = layer_k_rms[i]
+            v_rms = layer_v_rms[i]
+            if q_rms is not None:
+                layer_metrics[f"layer/{i:02d}/q_rms"] = q_rms
+            if k_rms is not None:
+                layer_metrics[f"layer/{i:02d}/k_rms"] = k_rms
+            if v_rms is not None:
+                layer_metrics[f"layer/{i:02d}/v_rms"] = v_rms
+            attn_params = list(block.attn.parameters())
+            mlp_params = list(block.mlp.parameters())
+            if attn_params:
+                attn_weights = torch.cat([p.detach().float().flatten() for p in attn_params])
+                layer_metrics[f"layer_hist/weight/attn/{i:02d}"] = wandb.Histogram(
+                    attn_weights.cpu().numpy(), num_bins=64
+                )
+                attn_grads = [p.grad.detach().float().flatten() for p in attn_params if p.grad is not None]
+                if attn_grads:
+                    layer_metrics[f"layer_hist/grad/attn/{i:02d}"] = wandb.Histogram(
+                        torch.cat(attn_grads).cpu().numpy(), num_bins=64
+                    )
+            if mlp_params:
+                mlp_weights = torch.cat([p.detach().float().flatten() for p in mlp_params])
+                layer_metrics[f"layer_hist/weight/mlp/{i:02d}"] = wandb.Histogram(
+                    mlp_weights.cpu().numpy(), num_bins=64
+                )
+                mlp_grads = [p.grad.detach().float().flatten() for p in mlp_params if p.grad is not None]
+                if mlp_grads:
+                    layer_metrics[f"layer_hist/grad/mlp/{i:02d}"] = wandb.Histogram(
+                        torch.cat(mlp_grads).cpu().numpy(), num_bins=64
+                    )
+        pre_step_params = None
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
@@ -547,6 +665,9 @@ while True:
             "train/epoch": current_epoch,
             "train/tokens_consumed": total_tokens_consumed, 
         })
+    if layer_metrics is not None:
+        layer_metrics["step"] = step
+        wandb_run.log(layer_metrics)
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.
