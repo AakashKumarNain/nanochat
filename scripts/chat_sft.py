@@ -14,6 +14,7 @@ import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
+import json
 import wandb
 import torch
 import numpy as np
@@ -156,6 +157,7 @@ model, tokenizer, meta = load_model("base", device, phase="train", model_tag=arg
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
+baseline_config = {}
 for name, fallback, source in [
     ("max_seq_len",       2048,  meta),
     ("device_batch_size", 32,    meta),
@@ -166,14 +168,34 @@ for name, fallback, source in [
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
+    baseline = pretrain_val if pretrain_val is not None else fallback
+    baseline_config[name] = baseline
     if arg_val is None:
-        resolved = pretrain_val if pretrain_val is not None else fallback
+        resolved = baseline
         setattr(args, name, resolved)
         print0(f"Inherited {name}={resolved} from pretrained checkpoint")
     elif pretrain_val is not None and arg_val != pretrain_val:
         print0(f"NOTE: --{name.replace('_', '-')}={arg_val} overrides pretrained value of {pretrain_val}")
     else:
         print0(f"Using {name}={arg_val}")
+
+extra_baselines = {
+    "init_lr_frac": parser.get_default("init_lr_frac"),
+    "warmup_ratio": parser.get_default("warmup_ratio"),
+    "warmdown_ratio": parser.get_default("warmdown_ratio"),
+    "final_lr_frac": parser.get_default("final_lr_frac"),
+    "mmlu_epochs": parser.get_default("mmlu_epochs"),
+    "gsm8k_epochs": parser.get_default("gsm8k_epochs"),
+    "load_optimizer": parser.get_default("load_optimizer"),
+    "num_iterations": parser.get_default("num_iterations"),
+    "model_tag": parser.get_default("model_tag"),
+    "model_step": parser.get_default("model_step"),
+}
+changed_hparams = {}
+for name, baseline in {**baseline_config, **extra_baselines}.items():
+    val = getattr(args, name)
+    if val != baseline:
+        changed_hparams[name] = val
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -233,6 +255,24 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
+dev_log_path = os.path.join(base_dir, "dev.log")
+
+def log_dev(event, step, metrics):
+    if not master_process:
+        return
+    try:
+        record = {
+            "ts": time.time(),
+            "run": args.run,
+            "step": step,
+            "event": event,
+            "metrics": metrics,
+            "changed_hparams": changed_hparams,
+        }
+        with open(dev_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print0(f"WARNING: failed to write dev.log: {e}")
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
@@ -438,7 +478,8 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
+        log_dev("val", step, {"val/bpb": val_bpb})
         model.train()
 
     
@@ -463,7 +504,7 @@ while True:
             completion = tokenizer.decode(sample[0])
             table.add_data(str(args.run), step, prompt, completion)
         # Log the current state of the table incrementally
-        wandb_run.log({"val/completions": table})
+        wandb_run.log({"val/completions": table}, step=step)
         model.train()
 
     # once in a while: estimate the ChatCORE metric (all ranks participate)
@@ -499,7 +540,16 @@ while True:
             "chatcore_metric": chatcore,
             "chatcore_cat": chatcore_cat,
             **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
-        })
+        }, step=step)
+        log_dev(
+            "chatcore",
+            step,
+            {
+                "chatcore_metric": chatcore,
+                "chatcore_cat": chatcore_cat,
+                **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
+            },
+        )
         model.train()
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
@@ -664,10 +714,11 @@ while True:
             "train/mfu": mfu,
             "train/epoch": current_epoch,
             "train/tokens_consumed": total_tokens_consumed, 
-        })
+        }, step=step)
+        log_dev("train", step, {"train/loss": debiased_smooth_loss})
     if layer_metrics is not None:
         layer_metrics["step"] = step
-        wandb_run.log(layer_metrics)
+        wandb_run.log(layer_metrics, step=step)
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.
@@ -694,7 +745,7 @@ get_report().log(section="SFT", data=[
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
     }
-])
+], experiment_name=args.run, changed_hparams=changed_hparams)
 
 # cleanup
 wandb_run.finish() # wandb run finish
