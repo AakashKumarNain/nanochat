@@ -248,14 +248,30 @@ class Report:
         os.makedirs(report_dir, exist_ok=True)
         self.report_dir = report_dir
 
-    def log(self, section, data):
+    def log(self, section, data, experiment_name=None, changed_hparams=None):
         """Log a section of data to the report."""
         slug = slugify(section)
         file_name = f"{slug}.md"
         file_path = os.path.join(self.report_dir, file_name)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(f"## {section}\n")
+        file_exists = os.path.exists(file_path)
+        mode = "a" if file_exists else "w"
+        with open(file_path, mode, encoding="utf-8") as f:
+            if not file_exists:
+                f.write(f"## {section}\n")
+            if experiment_name:
+                f.write(f"### Experiment: {experiment_name}\n")
             f.write(f"timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            if changed_hparams:
+                f.write("Changed hparams:\n")
+                for k, v in changed_hparams.items():
+                    if isinstance(v, float):
+                        vstr = f"{v:.4f}"
+                    elif isinstance(v, int) and v >= 10000:
+                        vstr = f"{v:,.0f}"
+                    else:
+                        vstr = str(v)
+                    f.write(f"- {k}: {vstr}\n")
+                f.write("\n")
             for item in data:
                 if not item:
                     # skip falsy values like None or empty dict etc.
