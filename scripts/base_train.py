@@ -13,6 +13,7 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["WANDB_MODE"] = "offline"
 import gc
 import json
 import time
@@ -23,6 +24,7 @@ from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
+import numpy as np
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -56,7 +58,7 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -84,6 +86,11 @@ parser.add_argument("--num_val_shards", type=int, default=-1, help="Number of da
 
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+changed_hparams = {}
+for k, v in vars(args).items():
+    default = parser.get_default(k)
+    if v != default and k != "run":
+        changed_hparams[k] = v
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -248,6 +255,43 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+depth = model.config.n_layer
+
+# Per-layer activation/QKV stats hooks (captured only when enabled)
+layer_stats_state = {"capture": False}
+layer_act_rms = [None] * depth
+layer_q_rms = [None] * depth
+layer_k_rms = [None] * depth
+layer_v_rms = [None] * depth
+
+def _rms(t):
+    return torch.sqrt(torch.mean(t.detach().float() ** 2))
+
+def _make_block_hook(layer_idx):
+    def hook(module, inp, out):
+        if not layer_stats_state["capture"]:
+            return
+        layer_act_rms[layer_idx] = _rms(out).item()
+    return hook
+
+def _make_qkv_hook(layer_idx, kind):
+    def hook(module, inp, out):
+        if not layer_stats_state["capture"]:
+            return
+        val = _rms(out).item()
+        if kind == "q":
+            layer_q_rms[layer_idx] = val
+        elif kind == "k":
+            layer_k_rms[layer_idx] = val
+        else:
+            layer_v_rms[layer_idx] = val
+    return hook
+
+for i, block in enumerate(orig_model.transformer.h):
+    block.register_forward_hook(_make_block_hook(i))
+    block.attn.c_q.register_forward_hook(_make_qkv_hook(i, "q"))
+    block.attn.c_k.register_forward_hook(_make_qkv_hook(i, "k"))
+    block.attn.c_v.register_forward_hook(_make_qkv_hook(i, "v"))
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -407,6 +451,7 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
     total_tokens_consumed = loop_state["total_tokens_consumed"]
+LAYER_STATS_EVERY = 50  # log per-layer stats to W&B every N steps (master only)
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -438,7 +483,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -455,7 +500,7 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -479,7 +524,7 @@ while True:
             completion = tokenizer.decode(sample[0])
             table.add_data(str(args.run), epoch, step, prompt, completion)
         # Log the current state of the table incrementally
-        wandb_run.log({"val/completions": table})
+        wandb_run.log({"val/completions": table}, step=step)
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -533,7 +578,87 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    log_layer_stats = master_process and ((step + 1) % LAYER_STATS_EVERY == 0)
+    pre_step_params = None
+    if log_layer_stats:
+        pre_step_params = [
+            [p.detach().clone() for p in block.parameters()]
+            for block in orig_model.transformer.h
+        ]
     optimizer.step()
+    layer_metrics = None
+    if log_layer_stats:
+        layer_stats_state["capture"] = True
+        for i in range(depth):
+            layer_act_rms[i] = None
+            layer_q_rms[i] = None
+            layer_k_rms[i] = None
+            layer_v_rms[i] = None
+        was_training = orig_model.training
+        orig_model.train()
+        with torch.no_grad(), autocast_ctx:
+            _ = orig_model(x, y)
+        if not was_training:
+            orig_model.eval()
+        layer_stats_state["capture"] = False
+
+        layer_metrics = {}
+        for i, block in enumerate(orig_model.transformer.h):
+            weight_sq = None
+            grad_sq = None
+            update_sq = None
+            for p, p_old in zip(block.parameters(), pre_step_params[i]):
+                if weight_sq is None:
+                    weight_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                    grad_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                    update_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                weight_sq += (p.detach().float() ** 2).sum()
+                if p.grad is not None:
+                    grad_sq += (p.grad.detach().float() ** 2).sum()
+                update_sq += ((p.detach() - p_old).float() ** 2).sum()
+            if weight_sq is None:
+                continue
+            weight_norm = torch.sqrt(weight_sq).item()
+            grad_norm = torch.sqrt(grad_sq).item()
+            update_norm = torch.sqrt(update_sq).item()
+            layer_metrics[f"layer/{i:02d}/weight_norm"] = weight_norm
+            layer_metrics[f"layer/{i:02d}/grad_norm"] = grad_norm
+            layer_metrics[f"layer/{i:02d}/update_ratio"] = update_norm / (weight_norm + 1e-8)
+            act_rms = layer_act_rms[i]
+            if act_rms is not None:
+                layer_metrics[f"layer/{i:02d}/act_rms"] = act_rms
+            q_rms = layer_q_rms[i]
+            k_rms = layer_k_rms[i]
+            v_rms = layer_v_rms[i]
+            if q_rms is not None:
+                layer_metrics[f"layer/{i:02d}/q_rms"] = q_rms
+            if k_rms is not None:
+                layer_metrics[f"layer/{i:02d}/k_rms"] = k_rms
+            if v_rms is not None:
+                layer_metrics[f"layer/{i:02d}/v_rms"] = v_rms
+            attn_params = list(block.attn.parameters())
+            mlp_params = list(block.mlp.parameters())
+            if attn_params:
+                attn_weights = torch.cat([p.detach().float().flatten() for p in attn_params])
+                layer_metrics[f"layer_hist/weight/attn/{i:02d}"] = wandb.Histogram(
+                    attn_weights.cpu().numpy(), num_bins=64
+                )
+                attn_grads = [p.grad.detach().float().flatten() for p in attn_params if p.grad is not None]
+                if attn_grads:
+                    layer_metrics[f"layer_hist/grad/attn/{i:02d}"] = wandb.Histogram(
+                        torch.cat(attn_grads).cpu().numpy(), num_bins=64
+                    )
+            if mlp_params:
+                mlp_weights = torch.cat([p.detach().float().flatten() for p in mlp_params])
+                layer_metrics[f"layer_hist/weight/mlp/{i:02d}"] = wandb.Histogram(
+                    mlp_weights.cpu().numpy(), num_bins=64
+                )
+                mlp_grads = [p.grad.detach().float().flatten() for p in mlp_params if p.grad is not None]
+                if mlp_grads:
+                    layer_metrics[f"layer_hist/grad/mlp/{i:02d}"] = wandb.Histogram(
+                        torch.cat(mlp_grads).cpu().numpy(), num_bins=64
+                    )
+        pre_step_params = None
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -578,7 +703,10 @@ while True:
             "train/muon_weight_decay": muon_weight_decay,
             "train/tokens_consumed": total_tokens_consumed, 
         }
-        wandb_run.log(log_data)
+        wandb_run.log(log_data, step=step)
+    if layer_metrics is not None:
+        layer_metrics["step"] = step
+        wandb_run.log(layer_metrics, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -624,7 +752,7 @@ get_report().log(section="Base model training", data=[
         "Total training time": f"{total_training_time/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
     }
-])
+], experiment_name=args.run, changed_hparams=changed_hparams)
 
 # cleanup
 wandb_run.finish() # wandb run finish
