@@ -16,6 +16,10 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import json
 import wandb
+try:
+    import weave
+except Exception as _weave_exc:
+    weave = None
 import torch
 import numpy as np
 from contextlib import nullcontext
@@ -100,6 +104,15 @@ else:
     # only for validation loop
     table = wandb.Table(columns=["exp_name", "step", "prompt", "completion"], log_mode="INCREMENTAL")
 
+# weave logging init (master only)
+weave_enabled = False
+if weave is not None and not use_dummy_wandb and master_process:
+    try:
+        weave.init("nanochat_logged_sft")
+        weave_enabled = True
+    except Exception as e:
+        print0(f"WARNING: weave init failed: {e}")
+
 from contextlib import nullcontext, contextmanager
 
 @contextmanager
@@ -155,6 +168,15 @@ if not HAS_FA3:
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
 
+# Large eval prompt set (loaded from file)
+prompts_path = os.path.join(os.path.dirname(__file__), "prompts", "sft_eval_64.txt")
+try:
+    with open(prompts_path, "r", encoding="utf-8") as f:
+        eval_prompts_large = [line.strip() for line in f if line.strip()]
+except Exception as e:
+    print0(f"WARNING: failed to load eval prompts from {prompts_path}: {e}")
+    eval_prompts_large = []
+
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
 baseline_config = {}
@@ -200,6 +222,13 @@ for name, baseline in {**baseline_config, **extra_baselines}.items():
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
+
+weave_prompt_cache = {}
+if weave is not None:
+    @weave.op()
+    def trace_eval_prompt(epoch, step, prompt):
+        """Weave trace: input epoch/step/prompt, output completion."""
+        return weave_prompt_cache.get(prompt, "")
 
 # Per-layer activation/QKV stats hooks (captured only when enabled)
 layer_stats_state = {"capture": False}
@@ -505,6 +534,22 @@ while True:
             table.add_data(str(args.run), step, prompt, completion)
         # Log the current state of the table incrementally
         wandb_run.log({"val/completions": table}, step=step)
+        if weave_enabled and eval_prompts_large:
+            # Evaluate prompts in batches, then trace each prompt sequentially with weave
+            weave_prompt_cache = {}
+            batch_size = 16
+            with disable_fp8(orig_model), autocast_ctx:
+                for start in range(0, len(eval_prompts_large), batch_size):
+                    batch = eval_prompts_large[start:start + batch_size]
+                    for prompt in batch:
+                        tokens = tokenizer(prompt, prepend="<|bos|>")
+                        sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                        completion = tokenizer.decode(sample[0])
+                        weave_prompt_cache[prompt] = completion
+            for prompt in eval_prompts_large:
+                _ = trace_eval_prompt(current_epoch, step, prompt)
+        torch.cuda.empty_cache()
+        gc.collect()
         model.train()
 
     # once in a while: estimate the ChatCORE metric (all ranks participate)
