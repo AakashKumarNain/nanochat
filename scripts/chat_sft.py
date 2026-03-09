@@ -101,6 +101,15 @@ else:
     if not args.run:
         raise ValueError("Please provide a name for your experiment by passing a valid value to the `run` argument!")
     wandb_run = wandb.init(project="nanochat_logged_sft", name=args.run, config=user_config)
+    try:
+        def exclude_fn(path, root):
+            rel = os.path.relpath(path, root)
+            excluded_dirs = ("cache/", "dev/", "runs/", "tests/", "wandb/", ".venv/")
+            return rel.startswith(excluded_dirs)
+
+        wandb_run.log_code(root=".", exclude_fn=exclude_fn)
+    except Exception as e:
+        print0(f"WARNING: wandb log_code failed: {e}")
     # only for validation loop
     table = wandb.Table(columns=["exp_name", "step", "prompt", "completion"], log_mode="INCREMENTAL")
 
