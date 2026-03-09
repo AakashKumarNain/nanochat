@@ -20,11 +20,12 @@ import argparse
 import os
 import itertools
 import wandb
+import numpy as np
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type, get_peak_flops
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -70,14 +71,60 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+if device_type == "cuda":
+    gpu_device_name = torch.cuda.get_device_name(0)
+    gpu_peak_flops = get_peak_flops(gpu_device_name)
+    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+else:
+    gpu_peak_flops = float('inf')
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat_logged_rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+orig_model = model
 engine = Engine(model, tokenizer) # for sampling rollouts
+model = torch.compile(model, dynamic=False)
+depth = model.config.n_layer
+
+# Per-layer activation/QKV stats hooks (captured only when enabled)
+layer_stats_state = {"capture": False}
+layer_act_rms = [None] * depth
+layer_q_rms = [None] * depth
+layer_k_rms = [None] * depth
+layer_v_rms = [None] * depth
+
+def _rms(t):
+    return torch.sqrt(torch.mean(t.detach().float() ** 2))
+
+def _make_block_hook(layer_idx):
+    def hook(module, inp, out):
+        if not layer_stats_state["capture"]:
+            return
+        layer_act_rms[layer_idx] = _rms(out).item()
+    return hook
+
+def _make_qkv_hook(layer_idx, kind):
+    def hook(module, inp, out):
+        if not layer_stats_state["capture"]:
+            return
+        val = _rms(out).item()
+        if kind == "q":
+            layer_q_rms[layer_idx] = val
+        elif kind == "k":
+            layer_k_rms[layer_idx] = val
+        else:
+            layer_v_rms[layer_idx] = val
+    return hook
+
+for i, block in enumerate(orig_model.transformer.h):
+    block.register_forward_hook(_make_block_hook(i))
+    block.attn.c_q.register_forward_hook(_make_qkv_hook(i, "q"))
+    block.attn.c_k.register_forward_hook(_make_qkv_hook(i, "k"))
+    block.attn.c_v.register_forward_hook(_make_qkv_hook(i, "v"))
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -217,6 +264,9 @@ def get_lr_multiplier(it):
     lrm = 1.0 - it / num_steps
     return lrm
 
+# Per-layer logging cadence
+LAYER_STATS_EVERY = 50
+
 # Calculate the number of examples each rank handles to achieve the desired examples_per_step
 print0(f"Total sequences per step: {args.examples_per_step * args.num_samples}") # total batch size in sequences/step
 assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step must be divisible by the number of ranks"
@@ -247,7 +297,7 @@ for step in range(num_steps):
         wandb_run.log({
             "step": step,
             **log_passk,
-        })
+        }, step=step)
 
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
@@ -299,18 +349,101 @@ for step in range(num_steps):
         "step": step,
         "reward": mean_reward,
         "sequence_length": mean_sequence_length,
-    })
+    }, step=step)
 
     # Update the model parameters
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+    log_layer_stats = master_process and ((step + 1) % LAYER_STATS_EVERY == 0)
+    pre_step_params = None
+    if log_layer_stats:
+        pre_step_params = [
+            [p.detach().clone() for p in block.parameters()]
+            for block in orig_model.transformer.h
+        ]
     optimizer.step()
+    layer_metrics = None
+    if log_layer_stats:
+        layer_stats_state["capture"] = True
+        for i in range(depth):
+            layer_act_rms[i] = None
+            layer_q_rms[i] = None
+            layer_k_rms[i] = None
+            layer_v_rms[i] = None
+        was_training = orig_model.training
+        orig_model.train()
+        with torch.no_grad(), autocast_ctx:
+            _ = orig_model(inputs, targets)
+        if not was_training:
+            orig_model.eval()
+        layer_stats_state["capture"] = False
+
+        layer_metrics = {}
+        for i, block in enumerate(orig_model.transformer.h):
+            weight_sq = None
+            grad_sq = None
+            update_sq = None
+            for p, p_old in zip(block.parameters(), pre_step_params[i]):
+                if weight_sq is None:
+                    weight_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                    grad_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                    update_sq = torch.zeros((), device=p.device, dtype=torch.float32)
+                weight_sq += (p.detach().float() ** 2).sum()
+                if p.grad is not None:
+                    grad_sq += (p.grad.detach().float() ** 2).sum()
+                update_sq += ((p.detach() - p_old).float() ** 2).sum()
+            if weight_sq is None:
+                continue
+            weight_norm = torch.sqrt(weight_sq).item()
+            grad_norm = torch.sqrt(grad_sq).item()
+            update_norm = torch.sqrt(update_sq).item()
+            layer_metrics[f"layer/{i:02d}/weight_norm"] = weight_norm
+            layer_metrics[f"layer/{i:02d}/grad_norm"] = grad_norm
+            layer_metrics[f"layer/{i:02d}/update_ratio"] = update_norm / (weight_norm + 1e-8)
+            act_rms = layer_act_rms[i]
+            if act_rms is not None:
+                layer_metrics[f"layer/{i:02d}/act_rms"] = act_rms
+            q_rms = layer_q_rms[i]
+            k_rms = layer_k_rms[i]
+            v_rms = layer_v_rms[i]
+            if q_rms is not None:
+                layer_metrics[f"layer/{i:02d}/q_rms"] = q_rms
+            if k_rms is not None:
+                layer_metrics[f"layer/{i:02d}/k_rms"] = k_rms
+            if v_rms is not None:
+                layer_metrics[f"layer/{i:02d}/v_rms"] = v_rms
+            attn_params = list(block.attn.parameters())
+            mlp_params = list(block.mlp.parameters())
+            if attn_params:
+                attn_weights = torch.cat([p.detach().float().flatten() for p in attn_params])
+                layer_metrics[f"layer_hist/weight/attn/{i:02d}"] = wandb.Histogram(
+                    attn_weights.cpu().numpy(), num_bins=64
+                )
+                attn_grads = [p.grad.detach().float().flatten() for p in attn_params if p.grad is not None]
+                if attn_grads:
+                    layer_metrics[f"layer_hist/grad/attn/{i:02d}"] = wandb.Histogram(
+                        torch.cat(attn_grads).cpu().numpy(), num_bins=64
+                    )
+            if mlp_params:
+                mlp_weights = torch.cat([p.detach().float().flatten() for p in mlp_params])
+                layer_metrics[f"layer_hist/weight/mlp/{i:02d}"] = wandb.Histogram(
+                    mlp_weights.cpu().numpy(), num_bins=64
+                )
+                mlp_grads = [p.grad.detach().float().flatten() for p in mlp_params if p.grad is not None]
+                if mlp_grads:
+                    layer_metrics[f"layer_hist/grad/mlp/{i:02d}"] = wandb.Histogram(
+                        torch.cat(mlp_grads).cpu().numpy(), num_bins=64
+                    )
+        pre_step_params = None
     model.zero_grad(set_to_none=True)
     wandb_run.log({
         "step": step,
         "lrm": lrm,
-    })
+    }, step=step)
+    if layer_metrics is not None:
+        layer_metrics["step"] = step
+        wandb_run.log(layer_metrics, step=step)
 
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
